@@ -1,0 +1,130 @@
+# =============================================================================
+# Ubuntu 26.04 Desktop - CIS Workstation autoinstall
+#
+# Scope (deliberately minimal):
+#   * CIS Level 2 partition layout on LUKS2-encrypted LVM, with CIS mount options
+#   * Two accounts: 'sysadmin' (sudo) and 'user' (no sudo)
+# All hardening and software configuration is done afterwards with Ansible.
+#
+# Place on the install media root as:  autoinstall.yaml
+# Replace EVERY <PLACEHOLDER> before use - see README.md.
+#
+# WARNING: wipes the LARGEST disk in the machine without asking.
+# =============================================================================
+autoinstall:
+  version: 1
+  interactive-sections: []          # fully unattended
+  refresh-installer:
+    update: no
+  shutdown: reboot
+
+  locale: en_GB.UTF-8
+  keyboard:
+    layout: gb
+  timezone: Europe/London
+
+  source:
+    id: ubuntu-desktop-minimal
+  updates: security
+  codecs:
+    install: false
+  drivers:
+    install: false                  # set true if the hardware needs proprietary drivers
+  oem:
+    install: false
+  ssh:
+    install-server: false
+
+  # Admin account - the installer adds this user to the 'sudo' group.
+  # Only used for sudo / installing packages / running Ansible.
+  identity:
+    realname: System Administrator
+    username: sysadmin
+    hostname: cis-ws01               # <CHANGE ME>
+    password: '<SYSADMIN_PASSWORD_HASH>'
+
+  # ---------------------------------------------------------------------------
+  # Storage: GPT / UEFI, LUKS2-encrypted LVM, CIS Level 2 separate mounts
+  #   p1  1G   ESP            /boot/efi   umask=0077
+  #   p2  2G   ext4           /boot       nodev,nosuid  (unencrypted - GRUB)
+  #   p3  rest LUKS2 -> LVM VG vg0
+  #        lv_root          40G  /
+  #        lv_var           30G  /var             nodev,nosuid
+  #        lv_var_tmp        5G  /var/tmp         nodev,nosuid,noexec
+  #        lv_var_log       10G  /var/log         nodev,nosuid,noexec
+  #        lv_var_log_audit 10G  /var/log/audit   nodev,nosuid,noexec
+  #        lv_tmp            8G  /tmp             nodev,nosuid,noexec
+  #        lv_swap           8G  swap
+  #        lv_home   remaining  /home            nodev,nosuid
+  #   /dev/shm (tmpfs) nodev,nosuid,noexec is added to fstab in late-commands
+  # ---------------------------------------------------------------------------
+  storage:
+    swap:
+      size: 0                       # no swap file - lv_swap is used instead
+    config:
+      - type: disk
+        id: disk0
+        match:
+          size: largest
+        ptable: gpt
+        wipe: superblock-recursive
+        preserve: false
+
+      - {type: partition, id: part-esp,  device: disk0, number: 1, size: 1G, flag: boot, grub_device: true, wipe: superblock, preserve: false}
+      - {type: partition, id: part-boot, device: disk0, number: 2, size: 2G, wipe: superblock, preserve: false}
+      - {type: partition, id: part-luks, device: disk0, number: 3, size: -1, wipe: superblock, preserve: false}
+
+      - type: dm_crypt
+        id: crypt0
+        volume: part-luks
+        dm_name: dm_crypt-0
+        key: '<LUKS_PASSPHRASE>'     # change after install: cryptsetup luksChangeKey
+        preserve: false
+
+      - {type: lvm_volgroup, id: vg0, name: vg0, devices: [crypt0], preserve: false}
+
+      - {type: lvm_partition, id: lv-root,          volgroup: vg0, name: lv_root,          size: 40G, wipe: superblock, preserve: false}
+      - {type: lvm_partition, id: lv-var,           volgroup: vg0, name: lv_var,           size: 30G, wipe: superblock, preserve: false}
+      - {type: lvm_partition, id: lv-var-tmp,       volgroup: vg0, name: lv_var_tmp,       size: 5G,  wipe: superblock, preserve: false}
+      - {type: lvm_partition, id: lv-var-log,       volgroup: vg0, name: lv_var_log,       size: 10G, wipe: superblock, preserve: false}
+      - {type: lvm_partition, id: lv-var-log-audit, volgroup: vg0, name: lv_var_log_audit, size: 10G, wipe: superblock, preserve: false}
+      - {type: lvm_partition, id: lv-tmp,           volgroup: vg0, name: lv_tmp,           size: 8G,  wipe: superblock, preserve: false}
+      - {type: lvm_partition, id: lv-swap,          volgroup: vg0, name: lv_swap,          size: 8G,  wipe: superblock, preserve: false}
+      # No size = all remaining space in vg0. Give it a size (e.g. 150G) if you
+      # want free space left in the VG for growing other volumes later.
+      - {type: lvm_partition, id: lv-home,          volgroup: vg0, name: lv_home,                     wipe: superblock, preserve: false}
+
+      - {type: format, id: fmt-esp,           volume: part-esp,         fstype: fat32, preserve: false}
+      - {type: format, id: fmt-boot,          volume: part-boot,        fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-root,          volume: lv-root,          fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-var,           volume: lv-var,           fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-var-tmp,       volume: lv-var-tmp,       fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-var-log,       volume: lv-var-log,       fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-var-log-audit, volume: lv-var-log-audit, fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-tmp,           volume: lv-tmp,           fstype: ext4,  preserve: false}
+      - {type: format, id: fmt-swap,          volume: lv-swap,          fstype: swap,  preserve: false}
+      - {type: format, id: fmt-home,          volume: lv-home,          fstype: ext4,  preserve: false}
+
+      # Mount order matters: parents before children.
+      - {type: mount, id: mnt-root,          device: fmt-root,          path: /}
+      - {type: mount, id: mnt-boot,          device: fmt-boot,          path: /boot,          options: 'nodev,nosuid'}
+      - {type: mount, id: mnt-esp,           device: fmt-esp,           path: /boot/efi,      options: 'umask=0077'}
+      - {type: mount, id: mnt-var,           device: fmt-var,           path: /var,           options: 'nodev,nosuid'}
+      - {type: mount, id: mnt-var-tmp,       device: fmt-var-tmp,       path: /var/tmp,       options: 'nodev,nosuid,noexec'}
+      - {type: mount, id: mnt-var-log,       device: fmt-var-log,       path: /var/log,       options: 'nodev,nosuid,noexec'}
+      - {type: mount, id: mnt-var-log-audit, device: fmt-var-log-audit, path: /var/log/audit, options: 'nodev,nosuid,noexec'}
+      - {type: mount, id: mnt-tmp,           device: fmt-tmp,           path: /tmp,           options: 'nodev,nosuid,noexec'}
+      - {type: mount, id: mnt-home,          device: fmt-home,          path: /home,          options: 'nodev,nosuid'}
+      - {type: mount, id: mnt-swap,          device: fmt-swap,          path: 'none'}
+
+  late-commands:
+    # /dev/shm is not a disk volume, so its CIS mount options are set in fstab here
+    - echo 'tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0' >> /target/etc/fstab
+    # Daily-use account: no sudo, no admin groups
+    - curtin in-target -- useradd -m -s /bin/bash -c "Workstation User" -G users user
+    - |
+      curtin in-target -- usermod -p '<USER_PASSWORD_HASH>' user
+
+  # On failure, keep the installer logs on the target disk (if it exists) for debugging.
+  error-commands:
+    - sh -c 'if [ -d /target/var/log ]; then mkdir -p /target/var/log/installer-error && cp -a /var/log/installer/. /target/var/log/installer-error/; fi; true'
